@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.json
+!requirements.txt
+out.json
+proxies.txt
+.venv/
+venv/
+.env
