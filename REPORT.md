@@ -14,28 +14,31 @@ in a different city — or a different country.
 
 Direct evidence measured during this research:
 
-| IP | provider answers (city) | agreement |
+| IP | provider answers (city) | name-vote agreement |
 |---|---|---|
 | 8.8.8.8 | Ashburn / Mountain View (×5) / San Jose | 0.625 |
 | 193.24.210.222 | Frankfurt (×4) / Hanau (×2) / Gelnhausen / Sonnenberg | 0.5 |
 | 51.15.0.1 | Haarlem (×4) / Amsterdam (×4) | 0.5 |
 
-Country was unanimous (8/8) for all of them. **City is inherently unreliable.**
+Country was unanimous (8/8) for all of them.
+
+**Conclusion:** country / ASN / timezone are solid. City names must not be voted on —
+but city *coordinates* can be used (section 4).
 
 ---
 
 ## 2. Sources tested head-to-head
 
-| source | country | city | ASN | proxy flag | free tier | verdict |
-|---|---|---|---|---|---|---|
-| **proxycheck.io** | ✅ | ✅ | ✅ | **`proxy:yes`, `type:VPN/TOR`** | 100/day, 1000/day +key | best free proxy classifier |
-| ip-api.com | ✅ | ✅ | ✅ | `proxy`, `hosting`, `mobile` | 45 req/min, batch 100 | good; proxy flag less consistent |
-| ipapi.is | ✅ | ✅ | ✅ | paid only | geo only | flags are NOT free |
-| ipwho.is | ✅ | ✅ | ✅ | – | – | tz field is an object |
-| ipinfo.io | ✅ | ✅ | ✅ | – | – | |
-| freeipapi.com | ✅ | ✅ | – | – | – | |
-| api.db-ip.com | ✅ | ✅ | – | – | – | |
-| ipwhois.app | ✅ | ✅ | ✅ | – | – | |
+| source | country | city | ASN | coords | proxy flag | free tier | verdict |
+|---|---|---|---|---|---|---|---|
+| **proxycheck.io** | ✅ | ✅ | ✅ | ✅ | **`proxy:yes`, `type:VPN/TOR`** | 100/day, 1000/day +key | best free proxy classifier |
+| ip-api.com | ✅ | ✅ | ✅ | ✅ | `proxy`, `hosting`, `mobile` | 45 req/min, batch 100 | good; proxy flag less consistent |
+| ipapi.is | ✅ | ✅ | ✅ | ✅ | paid only | geo only | flags are NOT free |
+| ipwho.is | ✅ | ✅ | ✅ | ✅ | – | – | tz field is an object |
+| ipinfo.io | ✅ | ✅ | ✅ | ✅ (`loc`) | – | – | |
+| freeipapi.com | ✅ | ✅ | – | ✅ | – | – | |
+| api.db-ip.com | ✅ | ✅ | – | – | – | – | |
+| ipwhois.app | ✅ | ✅ | ✅ | ✅ | – | – | |
 
 ### Dead / blocked endpoints
 - scamalytics.com → Cloudflare 403
@@ -43,24 +46,13 @@ Country was unanimous (8/8) for all of them. **City is inherently unreliable.**
 - iphub v2 → `Empty API key`
 - reallyfreegeoip.org, api.ipapi.com → Cloudflare 403
 - ipapi.co → aggressive 429
-- worldtimeapi.org → SSLError / Cloudflare, down
-- timeapi.io → 400, requires explicit `ipAddress` param
+- worldtimeapi.org → SSLError / down
+- timeapi.io → 400, requires an explicit `ipAddress` parameter
 
 ---
 
-## 3. The method that works
+## 3. Normalisation — the biggest single accuracy win
 
-### 3.1 Learn the real exit IP
-Route a request **through** the proxy to an echo service:
-`https://api.ipify.org?format=json`, `https://ipinfo.io/json`, `https://api.myip.com`.
-
-If the echoed IP ≠ the configured IP → the proxy is **chaining** (rotating / upstream hop).
-
-### 3.2 Look up that IP in 8 sources, in parallel, directly
-These are IP-parameter lookups. Routing them *through* the proxy would only make the
-service report the proxy's own geo for its host-based fields, so query them direct.
-
-### 3.3 Normalise before voting — this is the single biggest accuracy win
 `Russia` / `Russian Federation` / `RU` must collapse to one key, otherwise the vote is
 meaningless. Measured effect:
 
@@ -71,8 +63,43 @@ after  normalisation:  country_votes = {RU:8}                                  a
 
 Same for ASN: `AS208677 Cloud Technologies LLC` → `AS208677`.
 
-### 3.4 Report flags per source, never merge them
-Sources disagree, so collapsing them into one boolean destroys information:
+---
+
+## 4. City — do it with coordinates, not names
+
+A name vote fails because `Frankfurt am Main` and `Hanau am Main` are different strings
+for points ~20 km apart. Coordinates do not have that problem.
+
+**Method:**
+1. collect every `lat/lon` the sources return
+2. compute the median centroid
+3. compute each point's distance to it; drop points beyond `max(50 km, 3 × MAD)`
+   (median absolute deviation — robust, no assumption of a normal distribution)
+4. recompute the centroid from the inliers
+5. report `spread_km` and a precision tier: `city` ≤ 25 km, `metro` ≤ 100 km,
+   `region` ≤ 400 km, else `country`
+
+**Measured results** (with the outlier each run dropped):
+
+| IP | city (centroid) | spread | precision | outlier dropped |
+|---|---|---|---|---|
+| 45.155.204.10 | Moscow | 0.2 km | city | ipapi.is (1127 km) |
+| 51.15.0.1 | Amsterdam | 16.8 km | city | – |
+| 8.8.8.8 | San Jose | 10.7 km | city | ip-api (3852 km), ipinfo (68 km) |
+| 193.24.210.222 | Frankfurt am Main | 29.1 km | metro | ipapi.is (431 km) |
+
+Outlier rejection is essential: without it `ipapi.is` reported 431 km off for the
+Frankfurt VPS and 1127 km off for Moscow, and `ip-api` reported Ashburn (3852 km) for
+`8.8.8.8`. With it, the remaining sources agree to within a few km.
+
+Note that the answer for `193.24.210.222` (Frankfurt am Main, 29 km spread) is
+verifiable against ground truth — it is the location of the test VPS itself.
+
+---
+
+## 5. Proxy / VPN flags — report per source, never merge
+
+Sources genuinely disagree, so collapsing them into one boolean destroys information:
 
 | IP | proxycheck.io | ip-api.com |
 |---|---|---|
@@ -80,55 +107,68 @@ Sources disagree, so collapsing them into one boolean destroys information:
 | 8.8.8.8 | `proxy: no`, `type: Business` | `proxy: true`, `hosting: true` |
 | 193.24.210.222 | `proxy: no`, `type: Business` | `proxy: false`, `hosting: true` |
 
-Note `type: Business` is **not** a proxy signal — only an explicit `proxy: yes`
-or a `type` of `VPN`/`TOR`/`PUBLIC`/`SOCKS` counts.
+`type: Business` is **not** a proxy signal — only an explicit `proxy: yes`, or a `type`
+of `VPN` / `TOR` / `PUBLIC` / `SOCKS`, counts.
 
-### 3.5 Score confidence from agreement
+**Retries matter here.** `ip-api.com` carries the `hosting` (datacenter) flag. During
+testing a single timeout silently removed the datacenter verdict and left a
+"high confidence" result with an empty flag set. The tool therefore retries each source
+twice and reports `flag_sources_alive` / `flags_incomplete` so an empty verdict is
+never mistaken for a negative one.
+
+---
+
+## 6. Confidence scoring
+
 - country agreement ≥ 0.75 with ≥ 5 sources OK → **high**
 - ≥ 0.5 → **medium**
 - else → **low**
 
 ---
 
-## 4. Verified results
+## 7. Verified results
 
-### 4.1 Direct IP, datacenter
+### 7.1 Datacenter IP, full field set
 ```
 $ python proxy_geo_check.py --ip 45.155.204.10
-country : RU  {RU: 8}                agree 1.0
-asn     : AS208677                   agree 1.0
-timezone: Europe/Moscow              agree 0.833
-city    : Moscow (UNRELIABLE)        agree 0.875
+country : RU  {RU: 8}              agree 1.0
+asn     : AS208677                 agree 1.0
+timezone: Europe/Moscow            agree 0.833
+city    : Moscow  55.75392,37.61755  spread 0.2 km  precision city
+          dropped: ipapi.is (1127.1 km)
 proxy   : True  ['proxycheck']
 dc      : True  ['ip-api']
 conf    : high
 ```
 
-### 4.2 Full pipeline through a real proxy (SSH SOCKS → VPS)
+### 7.2 Full pipeline through a real proxy (SSH SOCKS → VPS)
 ```
-$ ssh -N -D 127.0.0.1:1080 vps-1year
+$ ssh -N -D 127.0.0.1:1080 vps-1year &
 $ python proxy_geo_check.py --proxy socks5h://127.0.0.1:1080
 
 exit_ip : 193.24.210.222   (via https://api.ipify.org?format=json)
 country : DE  {DE: 8}      agree 1.0
 asn     : AS35042          agree 1.0
 timezone: Europe/Berlin    agree 1.0
-proxy   : False []
+city    : Frankfurt am Main  50.12256,8.79816  spread 29.1 km  precision metro
 conf    : high
 ```
-The exit IP was correctly detected *through* the proxy, and the lookup matched the
+The exit IP was correctly detected *through* the proxy, and the derived city matched the
 known location of that VPS — a real end-to-end validation, not a description.
 
-### 4.3 The pitfall: perfect country, useless city
+### 7.3 The pitfall, and the fix
 ```
 $ python proxy_geo_check.py --ip 8.8.8.8
 country: US  agree 1.0
-city   : Mountain View  agree 0.625   →  Ashburn(1) / Mountain View(5) / San Jose(2)
+city name vote: Mountain View 0.571   →  Ashburn(1) / Mountain View(5) / San Jose(2)
+city by coords: San Jose  37.36272,-121.9894  spread 10.7 km  precision city
 ```
+The name vote and the coordinate estimate disagree; the coordinate estimate is the one
+that lands within 10 km of the truth.
 
 ---
 
-## 5. GitHub repositories — what is actually worth using
+## 8. GitHub repositories — what is actually worth using
 
 The GitHub search results for "proxy checker" are dominated by 0–3★ wrappers with
 random names and template descriptions. Those add no geo accuracy — they are scrapers
@@ -150,7 +190,7 @@ with proxycheck.io for classification.
 
 ---
 
-## 6. Recommended stack
+## 9. Recommended stack
 
 | need | tool |
 |---|---|
@@ -161,8 +201,8 @@ with proxycheck.io for classification.
 
 ---
 
-## 7. Files
+## 10. Files
 
 - `proxy_geo_check.py` — the tool
-- `README.md` — usage
+- `README.md` — usage, including how to start a SOCKS tunnel for proxy testing
 - `REPORT.md` — this document

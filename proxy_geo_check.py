@@ -6,28 +6,34 @@ WHY ONE API IS NOT ENOUGH
 -------------------------
 A geo lookup returns the ASN *registry* location, not the real exit location.
 For residential / rotating / mobile proxies that is frequently a datacenter
-city or simply the wrong one. Example measured here: 8.8.8.8 is reported as
-Ashburn, Mountain View AND San Jose by three different providers.
+city or simply the wrong one.
 
-WHAT IS ACTUALLY RELIABLE (measured)
-------------------------------------
-  country   -> yes, if you normalise the strings before voting
-  ASN       -> yes
-  proxy/VPN -> only as a *per-source flag*, sources disagree; report both
-  city      -> NO. Agreement is 0.12-0.5 even for a well-known IP.
-               Kept in the report for reference, never used in the verdict.
+WHAT IS RELIABLE (measured)
+---------------------------
+  country   -> yes, agreement 1.0 across 8 sources once strings are normalised
+  ASN       -> yes, agreement 1.0
+  timezone  -> yes, agreement 0.83-1.0
+  proxy/VPN -> per-source only; sources genuinely disagree, so every flag is
+               reported separately and never collapsed into one boolean
+  city      -> NOT reliable as a string vote ("Frankfurt am Main" vs "Hanau am
+               Main" vs "Gelnhausen" are different strings ~20 km apart).
+               This tool therefore estimates the location from COORDINATES:
+               it takes every lat/lon the sources return, computes the median
+               centroid, and reports the spread in km. City names are still
+               listed with their distance from that centroid.
 
 METHOD
 ------
   1. ECHO   route a request THROUGH the proxy to an echo service to learn the
             real exit IP (also detects chaining: exit IP != configured IP)
-  2. GEO    look that IP up in 8 independent sources IN PARALLEL
+  2. GEO    look that IP up in 8 independent sources IN PARALLEL, with retries
             (direct, NOT through the proxy: these are IP-parameter lookups,
              routing them via the proxy only leaks the proxy's own geo)
   3. VOTE   normalise country strings, then majority-vote on country + ASN
-  4. FLAGS  collect proxy / hosting / type flags per source and report them
+  4. LOCATE median centroid of all returned coordinates + spread in km
+  5. FLAGS  collect proxy / hosting / type flags per source and report them
             side by side instead of collapsing them into one boolean
-  5. SCORE  confidence from cross-source agreement
+  6. SCORE  confidence from cross-source agreement
 
 USAGE
 -----
@@ -40,7 +46,7 @@ USAGE
   Requires: pip install requests pysocks
 """
 
-import argparse, json, sys, time
+import argparse, json, math, sys, time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
@@ -50,37 +56,52 @@ except ImportError:
     sys.exit("pip install requests pysocks")
 
 UA = {"User-Agent": "curl/8.5.0"}
+RETRIES = 2          # per-source attempts; flag sources (ip-api/proxycheck) matter
+RETRY_BACKOFF = 0.8  # seconds
 
 # --------------------------------------------------------------------------
 # Geo sources. Each entry:
-#   name -> (url, country_path, city_path, flag_keys, asn_key, tz_key)
+#   name -> (url, country_path, city_path, flag_keys, asn_key, tz_key, coord)
+# coord is a callable(payload) -> (lat, lon) | None, handling each source's
+# own shape (ipinfo packs both into a "loc" string).
 # flag_keys are read verbatim from the payload and reported, never merged.
 # --------------------------------------------------------------------------
+def _f(*p):
+    return p
+
+
 SOURCES = {
     "ip-api": (
-        "http://ip-api.com/json/{ip}?fields=status,country,countryCode,city,isp,org,as,proxy,hosting,mobile,timezone",
-        ("country",), ("city",), ("proxy", "hosting", "mobile"), ("as",), ("timezone",)),
+        "http://ip-api.com/json/{ip}?fields=status,country,countryCode,regionName,city,"
+        "isp,org,as,proxy,hosting,mobile,timezone,lat,lon",
+        ("country",), ("city",), ("proxy", "hosting", "mobile"), ("as",), ("timezone",),
+        ("lat", "lon")),
     "proxycheck": (
         "https://proxycheck.io/v2/{ip}?vpn=1&asn=1",
-        ("country",), ("city",), ("proxy", "type"), ("asn",), ("timezone",)),
+        ("country",), ("city",), ("proxy", "type"), ("asn",), ("timezone",),
+        ("latitude", "longitude")),
     "ipwho.is": (
         "https://ipwho.is/{ip}",
-        ("country",), ("city",), None, ("connection", "asn"), ("timezone", "id")),
+        ("country",), ("city",), None, ("connection", "asn"), ("timezone", "id"),
+        ("latitude", "longitude")),
     "ipinfo": (
         "https://ipinfo.io/{ip}/json",
-        ("country",), ("city",), None, ("org",), ("timezone",)),
+        ("country",), ("city",), None, ("org",), ("timezone",),
+        ("loc",)),  # "lat,lon"
     "freeipapi": (
         "https://freeipapi.com/api/json/{ip}",
-        ("countryName",), ("cityName",), None, None, ("timeZone",)),
+        ("countryName",), ("cityName",), None, None, ("timeZone",),
+        ("latitude", "longitude")),
     "db-ip": (
         "https://api.db-ip.com/v2/free/{ip}",
-        ("countryName",), ("city",), None, None, ("timeZone",)),
+        ("countryName",), ("city",), None, None, ("timeZone",), None),
     "ipapi.is": (
         "https://api.ipapi.is/?q={ip}",
-        ("country",), ("city",), None, ("asn",), ("timezone",)),
+        ("country",), ("city",), None, ("asn",), ("timezone",), ("lat", "lon")),
     "ipwhois.app": (
         "https://ipwhois.app/json/{ip}",
-        ("country",), ("city",), None, ("asn",), ("timezone",)),
+        ("country",), ("city",), None, ("asn",), ("timezone",),
+        ("latitude", "longitude")),
 }
 
 # services that echo the caller IP (used through the proxy for exit detection)
@@ -155,19 +176,68 @@ def _dig(obj, path):
     return cur
 
 
-# --------------------------------------------------------------------------
-def query_source(name, tpl, ip, timeout=15):
-    """Look up an IP directly (NOT through the proxy — these are IP lookups)."""
+def _coord(payload, spec):
+    """Extract (lat, lon) for a source, handling its own shape."""
+    if not spec:
+        return None
     try:
-        r = requests.get(tpl.format(ip=ip), timeout=timeout, headers=UA)
-        if r.status_code != 200:
-            return name, {"_http": r.status_code}
+        if spec == ("loc",):                       # ipinfo: "37.386,-122.0838"
+            loc = _dig(payload, ("loc",))
+            if not loc or "," not in str(loc):
+                return None
+            a, b = str(loc).split(",")[:2]
+            return float(a), float(b)
+        lat, lon = _dig(payload, (spec[0],)), _dig(payload, (spec[1],))
+        if lat is None or lon is None:
+            return None
+        lat, lon = float(lat), float(lon)
+        if lat == 0.0 and lon == 0.0:              # null island = no data
+            return None
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return None
+        return lat, lon
+    except (TypeError, ValueError):
+        return None
+
+
+def haversine_km(a, b):
+    """Great-circle distance between (lat, lon) pairs, in km."""
+    (la1, lo1), (la2, lo2) = a, b
+    r = 6371.0
+    p1, p2 = math.radians(la1), math.radians(la2)
+    dp = math.radians(la2 - la1)
+    dl = math.radians(lo2 - lo1)
+    h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(min(1.0, math.sqrt(h)))
+
+
+def median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    if not n:
+        return None
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+# --------------------------------------------------------------------------
+def query_source(name, tpl, ip, timeout=15, retries=RETRIES):
+    """Look up an IP directly (NOT through the proxy — these are IP lookups)."""
+    last = None
+    for attempt in range(retries):
         try:
-            return name, r.json()
-        except ValueError:
-            return name, {"_nonjson": r.text[:100]}
-    except Exception as e:
-        return name, {"_err": type(e).__name__}
+            r = requests.get(tpl.format(ip=ip), timeout=timeout, headers=UA)
+            if r.status_code == 200:
+                try:
+                    return name, r.json()
+                except ValueError:
+                    last = {"_nonjson": r.text[:100]}
+            else:
+                last = {"_http": r.status_code}
+        except Exception as e:
+            last = {"_err": type(e).__name__}
+        if attempt + 1 < retries:
+            time.sleep(RETRY_BACKOFF * (attempt + 1))
+    return name, (last or {"_err": "unknown"})
 
 
 def echo_ip(proxies=None, timeout=20):
@@ -208,7 +278,7 @@ def check(ip=None, proxy_url=None):
         return report
     report["target_ip"] = target
 
-    # --- step 2: parallel geo lookup, direct
+    # --- step 2: parallel geo lookup, direct, with retries
     results = {}
     with ThreadPoolExecutor(max_workers=len(SOURCES)) as ex:
         futs = [ex.submit(query_source, n, SOURCES[n][0], target) for n in SOURCES]
@@ -217,16 +287,17 @@ def check(ip=None, proxy_url=None):
             results[n] = j
     report["raw"] = results
 
-    # --- step 3/4: votes + per-source flags
-    countries, cities, asns, tzs = [], [], [], []
+    # --- step 3/4/5: votes, coordinates, flags
+    countries, cities, asns, tzs, coords = [], [], [], [], []
     flags, per_source = {}, {}
     for n, j in results.items():
         if not isinstance(j, dict) or "_http" in j or "_err" in j or "_nonjson" in j:
+            per_source[n] = {"status": "failed", **{k: v for k, v in j.items() if k.startswith("_")}}
             continue
         payload = j.get(target, j)
         if not isinstance(payload, dict):
             payload = j
-        _, ck, cityk, fk, asnk, tzk = SOURCES[n]
+        _, ck, cityk, fk, asnk, tzk, coordk = SOURCES[n]
 
         c = _dig(payload, ck)
         city = _dig(payload, cityk)
@@ -234,6 +305,8 @@ def check(ip=None, proxy_url=None):
         tz = _dig(payload, tzk)
         if isinstance(tz, dict):
             tz = tz.get("id") or tz.get("name")
+        xy = _coord(payload, coordk)
+
         if c:
             countries.append((n, norm_country(c)))
         if city:
@@ -242,9 +315,12 @@ def check(ip=None, proxy_url=None):
             asns.append((n, asn))
         if tz:
             tzs.append((n, str(tz)))
+        if xy:
+            coords.append((n, xy))
         if fk:
             flags[n] = {k: _dig(payload, (k,)) for k in fk}
-        per_source[n] = {"country": c, "city": city, "asn": asn, "tz": tz}
+        per_source[n] = {"country": c, "city": city, "asn": asn, "tz": tz,
+                         "lat": xy[0] if xy else None, "lon": xy[1] if xy else None}
 
     cc, ac, tzc, cityc = (Counter(v for _, v in x)
                           for x in (countries, asns, tzs, cities))
@@ -260,16 +336,53 @@ def check(ip=None, proxy_url=None):
     tz, t_agree = top(tzc, len(tzs))
     city, city_agree = top(cityc, len(cities))
 
+    # --- step 4: coordinate-based location (robust: MAD outlier rejection)
+    location = None
+    if coords:
+        def centroid(pts):
+            return (median([p[1][0] for p in pts]), median([p[1][1] for p in pts]))
+
+        c0 = centroid(coords)
+        d0 = [haversine_km(c0, xy) for _, xy in coords]
+        mad = median([abs(d - median(d0)) for d in d0]) or 0.0
+        # a point is an outlier if it is far outside the median absolute deviation
+        cutoff = max(50.0, 3.0 * mad)
+        inliers = [p for p, d in zip(coords, d0) if d <= cutoff]
+        outliers = [(n, round(d, 1)) for (n, _), d in zip(coords, d0) if d > cutoff]
+        if not inliers:                       # degenerate: keep everything
+            inliers, outliers = coords, []
+
+        clat, clon = centroid(inliers)
+        centroid = (clat, clon)
+        dists = [(n, round(haversine_km(centroid, xy), 1)) for n, xy in inliers]
+        best_src, best_km = min(dists, key=lambda t: t[1])
+        spread = max(d for _, d in dists)
+        location = {
+            "lat": round(clat, 5),
+            "lon": round(clon, 5),
+            "best_city": per_source.get(best_src, {}).get("city"),
+            "best_source": best_src,
+            "spread_km": round(spread, 1),
+            "coords_used": len(inliers),
+            "coords_dropped": dict(outliers),
+            "per_source_km": dict(dists),
+            "precision": ("city" if spread <= 25 else
+                          "metro" if spread <= 100 else
+                          "region" if spread <= 400 else "country"),
+        }
+
     report.update({
         "sources_ok": len(countries),
+        "sources_total": len(SOURCES),
         "country_votes": dict(cc), "country": country, "country_agreement": c_agree,
         "asn_votes": dict(ac), "asn": asn, "asn_agreement": a_agree,
         "timezone_votes": dict(tzc), "timezone": tz, "timezone_agreement": t_agree,
         "city_votes": dict(cityc), "city": city, "city_agreement": city_agree,
+        "location": location,
         "flags": flags, "per_source": per_source,
     })
 
-    # --- step 5: verdict
+    # --- step 6: verdict
     # proxy signal = EXPLICIT proxy flag or an explicit VPN/TOR type.
     # "Business"/"hosting" alone is NOT a proxy signal.
     proxy_sources, hosting_sources = [], []
@@ -281,17 +394,25 @@ def check(ip=None, proxy_url=None):
         if f.get("hosting") is True:
             hosting_sources.append(n)
 
+    flag_sources_alive = [n for n in ("ip-api", "proxycheck") if n in flags]
     report["verdict"] = {
         "country": country,
         "asn": asn,
         "timezone": tz,
-        "city_unreliable": True,
-        "city_reported": city,
+        "city": (location or {}).get("best_city") or city,
+        "city_precision": (location or {}).get("precision", "unknown"),
+        "city_spread_km": (location or {}).get("spread_km"),
+        "city_sources_used": (location or {}).get("coords_used"),
+        "city_outliers_dropped": (location or {}).get("coords_dropped", {}),
+        "lat": (location or {}).get("lat"),
+        "lon": (location or {}).get("lon"),
+        "city_from_coordinates": bool(location),
         "flagged_as_proxy_vpn": bool(proxy_sources),
         "proxy_flagged_by": proxy_sources,
         "flagged_as_datacenter": bool(hosting_sources),
         "datacenter_flagged_by": hosting_sources,
-        "source_disagreement": sorted({n for n, _ in countries}) and len(set(v for _, v in countries)) > 1,
+        "flag_sources_alive": flag_sources_alive,
+        "flags_incomplete": len(flag_sources_alive) < 2,
         "confidence": ("high" if c_agree >= 0.75 and len(countries) >= 5
                        else "medium" if c_agree >= 0.5
                        else "low"),
@@ -318,7 +439,8 @@ def main():
             r = check(proxy_url=p)
             out.append(r)
             v = r.get("verdict", {})
-            print(f"{p:<55} {v.get('country','?'):<3} {v.get('asn','?'):<12} "
+            print(f"{p:<50} {str(v.get('country')):<3} {str(v.get('asn')):<12} "
+                  f"{str(v.get('city'))[:18]:<19} +-{v.get('city_spread_km')}km "
                   f"proxy={v.get('flagged_as_proxy_vpn')} dc={v.get('flagged_as_datacenter')} "
                   f"conf={v.get('confidence')}")
     else:
